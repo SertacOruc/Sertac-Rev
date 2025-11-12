@@ -1,22 +1,55 @@
-# R files
-.Rhistory
-.RData
-.Rproj.user
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# Output files
-output/
-*.pdf
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints
+
+# Data & outputs
+outputs/run_*/
+results/
 *.csv
+*.xlsx
+!outputs/Stations_Thrace_Turker.xlsx
 
-# Data files (usually large)
-data/
-*.txt
+# Cache
+.cache/
+*.cache
 
-# System files
+# OS
 .DS_Store
 Thumbs.db
 
-# IDE files
-.vscode/
-.idea/
-*.Rproj
+# Logs
+*.log
