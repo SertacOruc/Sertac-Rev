@@ -2,11 +2,18 @@
 ## COMPLETE GUMBEL EXTREME RAINFALL ANALYSIS
 ## Single run-ready script with all functions included
 ##
+## FEATURES:
+## - Stationary Gumbel analysis (constant parameters)
+## - Nonstationary Gumbel analysis (time-varying location parameter)
+## - Trend detection and quantification
+## - Comprehensive visualizations and diagnostics
+##
 ## INSTRUCTIONS:
 ## 1. Install required package: install.packages("extRemes")
-## 2. Edit the CONFIGURATION section below (lines 20-35)
-## 3. Run the entire script
-## 4. Results will be saved to the output/ folder
+## 2. Edit the CONFIGURATION section below (lines 18-43)
+## 3. Set RUN_NONSTATIONARY = TRUE to include trend analysis
+## 4. Run the entire script
+## 5. Results will be saved to the output/ folder
 ################################################################################
 
 library(extRemes)
@@ -37,6 +44,10 @@ INTERVALS_PER_DAY <- 288
 DAYS_PER_MONTH <- 30
 MONTHS_PER_YEAR <- 12
 INTERVAL_MINUTES <- 5
+
+# Nonstationary analysis settings
+RUN_NONSTATIONARY <- TRUE  # Set to FALSE to skip nonstationary analysis
+NONSTATIONARY_TARGET_YEARS <- NULL  # NULL for auto (start, middle, end)
 
 ################################################################################
 ## UTILITY FUNCTIONS
@@ -511,6 +522,264 @@ check_return_levels <- function(results, return_period = 100, verbose = TRUE) {
 }
 
 ################################################################################
+## NONSTATIONARY GUMBEL ANALYSIS FUNCTIONS
+################################################################################
+
+#' Fit nonstationary Gumbel distribution with time-varying location parameter
+#' @param data Vector of annual maximum values
+#' @param years Vector of corresponding years
+#' @param duration_name Name of duration for reporting
+#' @param method Fitting method ("MLE" or "GMLE")
+#' @param verbose Print fit information
+#' @return Fitted extRemes fevd object with trend, or NULL if fit fails
+#' @export
+fit_nonstationary_gumbel <- function(data, years, duration_name = NULL,
+                                     method = "MLE", verbose = TRUE) {
+
+  # Remove NA values
+  valid_idx <- !is.na(data)
+  data_clean <- data[valid_idx]
+  years_clean <- years[valid_idx]
+
+  if (length(data_clean) < 10) {
+    warning(sprintf("Insufficient data for %s: only %d values",
+                   duration_name, length(data_clean)))
+    return(NULL)
+  }
+
+  if (verbose && !is.null(duration_name)) {
+    print_section(sprintf("Fitting Nonstationary Gumbel: %s", duration_name))
+    cat(sprintf("  Data points: %d\n", length(data_clean)))
+    cat(sprintf("  Year range: %d - %d\n", min(years_clean), max(years_clean)))
+    cat(sprintf("  Mean: %.2f mm\n", mean(data_clean)))
+    cat(sprintf("  SD: %.2f mm\n", sd(data_clean)))
+  }
+
+  # Normalize years for numerical stability
+  year_mean <- mean(years_clean)
+  years_normalized <- years_clean - year_mean
+
+  # Fit Gumbel with linear trend in location parameter
+  # location = mu0 + mu1 * (year - year_mean)
+  fit <- tryCatch({
+    fevd(data_clean,
+         data = data.frame(year_norm = years_normalized),
+         location.fun = ~year_norm,
+         type = "Gumbel",
+         method = method)
+  }, error = function(e) {
+    if (verbose) cat(sprintf("  ERROR: %s\n", e$message))
+    return(NULL)
+  })
+
+  if (is.null(fit)) return(NULL)
+
+  # Store year normalization info
+  attr(fit, "year_mean") <- year_mean
+  attr(fit, "years_original") <- years_clean
+
+  if (verbose) {
+    params <- findpars(fit)
+    cat(sprintf("  Location μ₀ (intercept): %.3f\n", params$location[1]))
+    cat(sprintf("  Location μ₁ (trend): %.3f mm/year\n", params$location[2]))
+    cat(sprintf("  Scale (σ): %.3f\n", params$scale))
+
+    # Calculate trend direction and significance
+    trend_per_decade <- params$location[2] * 10
+    cat(sprintf("  Trend: %.3f mm/decade\n", trend_per_decade))
+
+    if (abs(params$location[2]) > 0.01) {
+      direction <- ifelse(params$location[2] > 0, "INCREASING ↑", "DECREASING ↓")
+      cat(sprintf("  Direction: %s\n", direction))
+    } else {
+      cat("  Direction: STABLE (~0)\n")
+    }
+  }
+
+  return(fit)
+}
+
+#' Calculate nonstationary return levels for specific years
+#' @param fit Fitted nonstationary fevd object
+#' @param return_periods Vector of return periods (years)
+#' @param target_years Vector of years for which to calculate return levels
+#' @return Matrix of return levels (rows = years, cols = return periods)
+#' @export
+calculate_nonstationary_return_levels <- function(fit,
+                                                  return_periods = RETURN_PERIODS,
+                                                  target_years = NULL) {
+
+  if (is.null(fit)) {
+    return(NULL)
+  }
+
+  # Get year normalization info
+  year_mean <- attr(fit, "year_mean")
+  if (is.null(year_mean)) {
+    warning("Year normalization info not found in fit object")
+    return(NULL)
+  }
+
+  # If no target years specified, use quartiles of the data range
+  if (is.null(target_years)) {
+    years_orig <- attr(fit, "years_original")
+    if (is.null(years_orig)) {
+      warning("Original years not found in fit object")
+      return(NULL)
+    }
+    target_years <- round(quantile(years_orig, probs = c(0.25, 0.5, 0.75)))
+  }
+
+  # Calculate return levels for each target year
+  rl_matrix <- matrix(NA, nrow = length(target_years), ncol = length(return_periods))
+  rownames(rl_matrix) <- paste0("Year", target_years)
+  colnames(rl_matrix) <- paste0("RL", return_periods)
+
+  for (i in seq_along(target_years)) {
+    year_norm <- target_years[i] - year_mean
+
+    tryCatch({
+      rl <- return.level(fit,
+                        return.period = return_periods,
+                        make.plot = FALSE,
+                        do.ci = FALSE,
+                        x = data.frame(year_norm = year_norm))
+      rl_matrix[i, ] <- rl
+    }, error = function(e) {
+      warning(sprintf("Error calculating return levels for year %d: %s",
+                     target_years[i], e$message))
+    })
+  }
+
+  return(rl_matrix)
+}
+
+#' Analyze all durations with nonstationary Gumbel
+#' @param annual_max_df Data frame from calculate_annual_maxima
+#' @param durations Vector of durations (uses DURATIONS if NULL)
+#' @param duration_names Names for durations (uses DURATION_NAMES if NULL)
+#' @param return_periods Return periods to calculate
+#' @param target_years Years for return level calculation
+#' @param method Fitting method
+#' @param verbose Print progress
+#' @return List with results data frame and fitted models
+#' @export
+analyze_all_durations_nonstationary <- function(annual_max_df,
+                                                durations = NULL,
+                                                duration_names = NULL,
+                                                return_periods = RETURN_PERIODS,
+                                                target_years = NULL,
+                                                method = "MLE",
+                                                verbose = TRUE) {
+
+  if (is.null(durations)) durations <- DURATIONS
+  if (is.null(duration_names)) duration_names <- DURATION_NAMES
+
+  if (verbose) {
+    print_header("NONSTATIONARY GUMBEL ANALYSIS - ALL DURATIONS")
+  }
+
+  years <- annual_max_df$year
+
+  # If no target years specified, use start, middle, and end
+  if (is.null(target_years)) {
+    target_years <- c(min(years), median(years), max(years))
+  }
+
+  n_durations <- length(duration_names)
+
+  # Initialize results data frame
+  results <- data.frame(
+    Duration = duration_names,
+    Mean = NA,
+    SD = NA,
+    Max = NA,
+    Location_Intercept = NA,
+    Location_Trend = NA,
+    Scale = NA,
+    Trend_Per_Decade = NA
+  )
+
+  # Add columns for return levels at each target year
+  for (yr in target_years) {
+    for (rp in return_periods) {
+      col_name <- sprintf("RL%d_Year%d", rp, yr)
+      results[[col_name]] <- NA
+    }
+  }
+
+  # Store fitted models
+  fitted_models <- list()
+
+  # Fit each duration
+  for (i in 1:n_durations) {
+    dur_name <- duration_names[i]
+    data_dur <- annual_max_df[[dur_name]]
+
+    if (verbose) {
+      cat("\n")
+      cat(paste(rep("-", 60), collapse = ""), "\n")
+      cat(sprintf("Duration %d/%d: %s\n", i, n_durations, dur_name))
+      cat(paste(rep("-", 60), collapse = ""), "\n")
+    }
+
+    # Basic statistics
+    results$Mean[i] <- safe_mean(data_dur)
+    results$SD[i] <- sd(data_dur, na.rm = TRUE)
+    results$Max[i] <- safe_max(data_dur)
+
+    # Fit nonstationary Gumbel
+    fit <- fit_nonstationary_gumbel(data_dur, years, dur_name,
+                                    method = method, verbose = verbose)
+    fitted_models[[dur_name]] <- fit
+
+    if (!is.null(fit)) {
+      # Extract parameters
+      params <- findpars(fit)
+      results$Location_Intercept[i] <- params$location[1]
+      results$Location_Trend[i] <- params$location[2]
+      results$Scale[i] <- params$scale
+      results$Trend_Per_Decade[i] <- params$location[2] * 10
+
+      # Calculate return levels for target years
+      rl_matrix <- calculate_nonstationary_return_levels(fit, return_periods, target_years)
+
+      if (!is.null(rl_matrix) && verbose) {
+        cat("\n  Return Levels by Year:\n")
+        print(round(rl_matrix, 2))
+      }
+
+      # Store in results
+      if (!is.null(rl_matrix)) {
+        for (j in seq_along(target_years)) {
+          yr <- target_years[j]
+          for (k in seq_along(return_periods)) {
+            rp <- return_periods[k]
+            col_name <- sprintf("RL%d_Year%d", rp, yr)
+            results[[col_name]][i] <- rl_matrix[j, k]
+          }
+        }
+      }
+    }
+  }
+
+  if (verbose) {
+    cat("\n")
+    print_header("NONSTATIONARY ANALYSIS COMPLETE")
+    cat("\nTrend Summary:\n")
+    trend_summary <- results[, c("Duration", "Location_Trend", "Trend_Per_Decade")]
+    print(trend_summary)
+  }
+
+  # Return both results and fitted models
+  return(list(
+    results = results,
+    fitted_models = fitted_models,
+    target_years = target_years
+  ))
+}
+
+################################################################################
 ## VISUALIZATION FUNCTIONS
 ################################################################################
 
@@ -672,6 +941,262 @@ create_summary_table <- function(results, annual_max_df, return_period = 100) {
 }
 
 ################################################################################
+## NONSTATIONARY VISUALIZATION FUNCTIONS
+################################################################################
+
+#' Plot trend parameters (location trend) for all durations
+#' @param ns_results Results from analyze_all_durations_nonstationary
+#' @param col Bar color
+#' @export
+plot_trend_parameters <- function(ns_results, col = "coral") {
+  results <- ns_results$results
+
+  # Create bar plot with trend per decade
+  barplot(results$Trend_Per_Decade,
+          names.arg = results$Duration,
+          col = col,
+          main = "Trend in Extreme Rainfall (Nonstationary Analysis)",
+          ylab = "Trend (mm/decade)",
+          las = 2,
+          border = NA)
+
+  # Add zero line
+  abline(h = 0, col = "black", lwd = 2, lty = 2)
+
+  grid(nx = NA, ny = NULL, col = "gray90", lty = 1)
+}
+
+#' Plot return levels comparison across years
+#' @param ns_results Results from analyze_all_durations_nonstationary
+#' @param return_period Return period to plot
+#' @param colors Vector of colors for each year
+#' @export
+plot_nonstationary_return_levels <- function(ns_results,
+                                             return_period = 100,
+                                             colors = NULL) {
+
+  results <- ns_results$results
+  target_years <- ns_results$target_years
+
+  if (is.null(colors)) {
+    colors <- c("steelblue", "orange", "darkred")
+  }
+
+  # Find columns for this return period
+  rl_cols <- grep(sprintf("^RL%d_Year", return_period), names(results), value = TRUE)
+
+  if (length(rl_cols) == 0) {
+    stop(sprintf("No return level columns found for RP=%d", return_period))
+  }
+
+  # Extract data
+  rl_data <- results[, rl_cols, drop = FALSE]
+  n_years <- ncol(rl_data)
+  n_durations <- nrow(rl_data)
+
+  # Set up plot
+  barplot_data <- as.matrix(t(rl_data))
+
+  bp <- barplot(barplot_data,
+                beside = TRUE,
+                names.arg = results$Duration,
+                col = colors[1:n_years],
+                main = sprintf("%d-Year Return Levels (Nonstationary)", return_period),
+                ylab = "Precipitation (mm)",
+                las = 2,
+                border = NA,
+                ylim = c(0, max(barplot_data, na.rm = TRUE) * 1.1))
+
+  # Add legend
+  legend("topleft",
+         legend = paste0("Year ", target_years),
+         fill = colors[1:n_years],
+         bty = "n",
+         title = "Time Period")
+
+  grid(nx = NA, ny = NULL, col = "gray90", lty = 1)
+}
+
+#' Plot time series with fitted trend
+#' @param annual_max_df Data frame from calculate_annual_maxima
+#' @param ns_results Results from analyze_all_durations_nonstationary
+#' @param duration_name Duration to plot
+#' @export
+plot_trend_timeseries <- function(annual_max_df, ns_results, duration_name = "1hr") {
+
+  if (!duration_name %in% names(annual_max_df)) {
+    stop(sprintf("Duration '%s' not found", duration_name))
+  }
+
+  years <- annual_max_df$year
+  values <- annual_max_df[[duration_name]]
+
+  # Get fitted model
+  fitted_models <- ns_results$fitted_models
+  fit <- fitted_models[[duration_name]]
+
+  # Plot observed data
+  plot(years, values,
+       type = "p", pch = 19, col = "darkblue", cex = 0.8,
+       xlab = "Year",
+       ylab = "Annual Maximum (mm)",
+       main = sprintf("Trend Analysis - %s", duration_name))
+
+  # Add fitted trend line if available
+  if (!is.null(fit)) {
+    params <- findpars(fit)
+    year_mean <- attr(fit, "year_mean")
+
+    # Calculate fitted values
+    years_norm <- years - year_mean
+    fitted_location <- params$location[1] + params$location[2] * years_norm
+
+    lines(years, fitted_location, col = "red", lwd = 3, lty = 1)
+
+    # Add confidence band (approximate)
+    se <- params$scale / sqrt(length(years))
+    polygon(c(years, rev(years)),
+            c(fitted_location + 1.96*se, rev(fitted_location - 1.96*se)),
+            col = rgb(1, 0, 0, 0.2), border = NA)
+
+    # Add legend
+    trend_str <- sprintf("%.3f mm/year", params$location[2])
+    legend("topleft",
+           legend = c("Observed", paste("Trend:", trend_str), "95% CI"),
+           col = c("darkblue", "red", rgb(1, 0, 0, 0.2)),
+           pch = c(19, NA, 15),
+           lty = c(NA, 1, NA),
+           lwd = c(NA, 3, NA),
+           bty = "n")
+  }
+
+  grid(col = "gray90", lty = 1)
+}
+
+#' Plot comparison of stationary vs nonstationary return levels
+#' @param stat_results Results from analyze_all_durations (stationary)
+#' @param ns_results Results from analyze_all_durations_nonstationary
+#' @param return_period Return period to compare
+#' @param target_year Year for nonstationary comparison (default: end year)
+#' @export
+plot_stationary_vs_nonstationary <- function(stat_results, ns_results,
+                                             return_period = 100,
+                                             target_year = NULL) {
+
+  stat_rl_col <- paste0("RL", return_period)
+
+  # If no target year specified, use the last year
+  if (is.null(target_year)) {
+    target_year <- max(ns_results$target_years)
+  }
+
+  ns_rl_col <- sprintf("RL%d_Year%d", return_period, target_year)
+
+  # Extract data
+  durations <- stat_results$Duration
+  stat_rl <- stat_results[[stat_rl_col]]
+  ns_rl <- ns_results$results[[ns_rl_col]]
+
+  # Create comparison plot
+  plot_data <- rbind(stat_rl, ns_rl)
+
+  bp <- barplot(plot_data,
+                beside = TRUE,
+                names.arg = durations,
+                col = c("steelblue", "coral"),
+                main = sprintf("%d-Year Return Levels: Stationary vs Nonstationary (Year %d)",
+                              return_period, target_year),
+                ylab = "Precipitation (mm)",
+                las = 2,
+                border = NA,
+                ylim = c(0, max(plot_data, na.rm = TRUE) * 1.1))
+
+  # Add legend
+  legend("topleft",
+         legend = c("Stationary", sprintf("Nonstationary (Year %d)", target_year)),
+         fill = c("steelblue", "coral"),
+         bty = "n")
+
+  grid(nx = NA, ny = NULL, col = "gray90", lty = 1)
+
+  # Calculate and print differences
+  diff_pct <- ((ns_rl - stat_rl) / stat_rl) * 100
+
+  cat("\nDifference (Nonstationary - Stationary):\n")
+  for (i in seq_along(durations)) {
+    cat(sprintf("  %-6s: %+6.2f mm (%+5.1f%%)\n",
+                durations[i], ns_rl[i] - stat_rl[i], diff_pct[i]))
+  }
+}
+
+#' Create comprehensive nonstationary summary plots
+#' @param annual_max_df Data frame from calculate_annual_maxima
+#' @param stat_results Results from analyze_all_durations (stationary)
+#' @param ns_results Results from analyze_all_durations_nonstationary
+#' @param return_period Return period for plots
+#' @export
+plot_nonstationary_summary <- function(annual_max_df, stat_results, ns_results,
+                                       return_period = 100) {
+
+  # Set up 2x2 layout
+  par(mfrow = c(2, 2), mar = c(5, 4, 3, 2))
+
+  # 1. Trend parameters
+  plot_trend_parameters(ns_results)
+
+  # 2. Return levels across years
+  plot_nonstationary_return_levels(ns_results, return_period = return_period)
+
+  # 3. Stationary vs Nonstationary comparison
+  plot_stationary_vs_nonstationary(stat_results, ns_results, return_period = return_period)
+
+  # 4. Example trend time series
+  plot_trend_timeseries(annual_max_df, ns_results, duration_name = "1hr")
+
+  # Reset layout
+  par(mfrow = c(1, 1))
+}
+
+#' Export nonstationary plots to PDF
+#' @param annual_max_df Data frame from calculate_annual_maxima
+#' @param stat_results Results from analyze_all_durations (stationary)
+#' @param ns_results Results from analyze_all_durations_nonstationary
+#' @param output_path Output PDF path
+#' @param return_period Return period for plots
+#' @param verbose Print confirmation
+#' @export
+export_nonstationary_plots_pdf <- function(annual_max_df, stat_results, ns_results,
+                                           output_path = "nonstationary_gumbel_plots.pdf",
+                                           return_period = 100,
+                                           verbose = TRUE) {
+
+  pdf(output_path, width = 11, height = 8.5)
+
+  # Page 1: Summary plots
+  plot_nonstationary_summary(annual_max_df, stat_results, ns_results, return_period)
+
+  # Page 2: Trend time series for multiple durations
+  par(mfrow = c(2, 2), mar = c(4, 4, 3, 2))
+  for (dur in c("5min", "1hr", "6hr", "24hr")) {
+    if (dur %in% names(annual_max_df)) {
+      plot_trend_timeseries(annual_max_df, ns_results, dur)
+    }
+  }
+
+  # Page 3: Return level comparisons for different return periods
+  par(mfrow = c(2, 2), mar = c(5, 4, 3, 2))
+  for (rp in c(10, 25, 50, 100)) {
+    plot_nonstationary_return_levels(ns_results, return_period = rp)
+  }
+
+  dev.off()
+
+  if (verbose) {
+    cat(sprintf("\n✓ Nonstationary plots exported to: %s\n", output_path))
+  }
+}
+
+################################################################################
 ## MAIN ANALYSIS WORKFLOW
 ################################################################################
 
@@ -768,10 +1293,64 @@ if (EXPORT_PLOTS) {
   )
 }
 
+################################################################################
+## NONSTATIONARY ANALYSIS (if enabled)
+################################################################################
+
+if (RUN_NONSTATIONARY) {
+
+  print_header("NONSTATIONARY ANALYSIS")
+
+  # Fit nonstationary models
+  ns_results <- analyze_all_durations_nonstationary(
+    annual_max_df = annual_max,
+    durations = DURATIONS,
+    duration_names = DURATION_NAMES,
+    return_periods = RETURN_PERIODS,
+    target_years = NONSTATIONARY_TARGET_YEARS,
+    method = "MLE",
+    verbose = VERBOSE
+  )
+
+  # Create nonstationary visualizations
+  print_header("NONSTATIONARY VISUALIZATIONS")
+
+  cat("\nGenerating nonstationary summary plots...\n")
+  plot_nonstationary_summary(annual_max, results, ns_results, return_period = 100)
+
+  # Export nonstationary results
+  print_header("EXPORTING NONSTATIONARY RESULTS")
+
+  if (EXPORT_RESULTS) {
+    ns_results_clean <- ns_results$results
+
+    ns_results_path <- file.path(OUTPUT_DIR, "nonstationary_gumbel_results.csv")
+    write.csv(ns_results_clean, ns_results_path, row.names = FALSE)
+    cat(sprintf("✓ Nonstationary results exported to: %s\n", ns_results_path))
+  }
+
+  if (EXPORT_PLOTS) {
+    ns_plots_path <- file.path(OUTPUT_DIR, "nonstationary_gumbel_plots.pdf")
+    export_nonstationary_plots_pdf(
+      annual_max_df = annual_max,
+      stat_results = results,
+      ns_results = ns_results,
+      output_path = ns_plots_path,
+      return_period = 100,
+      verbose = TRUE
+    )
+  }
+
+} else {
+  cat("\nNonstationary analysis skipped (RUN_NONSTATIONARY = FALSE)\n")
+}
+
+################################################################################
 # Final summary
 print_header("ANALYSIS COMPLETE")
 
 cat("\nOutput files:\n")
+cat("\nStationary Analysis:\n")
 if (EXPORT_ANNUAL_MAX) {
   cat(sprintf("  - Annual maxima: %s\n",
              file.path(OUTPUT_DIR, "annual_maxima.csv")))
@@ -783,6 +1362,18 @@ if (EXPORT_RESULTS) {
 if (EXPORT_PLOTS) {
   cat(sprintf("  - Plots: %s\n",
              file.path(OUTPUT_DIR, "gumbel_analysis_plots.pdf")))
+}
+
+if (RUN_NONSTATIONARY) {
+  cat("\nNonstationary Analysis:\n")
+  if (EXPORT_RESULTS) {
+    cat(sprintf("  - Nonstationary results: %s\n",
+               file.path(OUTPUT_DIR, "nonstationary_gumbel_results.csv")))
+  }
+  if (EXPORT_PLOTS) {
+    cat(sprintf("  - Nonstationary plots: %s\n",
+               file.path(OUTPUT_DIR, "nonstationary_gumbel_plots.pdf")))
+  }
 }
 
 cat("\n")
